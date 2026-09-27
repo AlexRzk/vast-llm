@@ -12,6 +12,6 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Syntax check
-        run: bash -n vast-llm && bash -n vast-llm-launcher && bash -n vast-llm-entry && bash -n vast-llm-bench && bash -n vast-llm-doctor && bash -n install.sh
+        run: bash -n vast-llm && bash -n vast-llm-launcher && bash -n vast-llm-entry && bash -n vast-llm-bench && bash -n vast-llm-doctor && bash -n vast-llm-auto && bash -n install.sh
       - name: Shellcheck
-        run: shellcheck -x vast-llm vast-llm-launcher vast-llm-entry vast-llm-bench vast-llm-doctor install.sh
+        run: shellcheck -x vast-llm vast-llm-launcher vast-llm-entry vast-llm-bench vast-llm-doctor vast-llm-auto install.sh
