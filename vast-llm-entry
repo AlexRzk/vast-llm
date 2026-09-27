@@ -2,16 +2,22 @@
 set -u
 
 LIB_DIR="${VAST_LLM_LIB_DIR:-/usr/local/lib/vast-llm}"
+ENV_FILE="$LIB_DIR/environment"
+if [[ -r "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
 CORE="${VAST_LLM_CORE:-$LIB_DIR/vast-llm-core}"
 UI="${VAST_LLM_UI:-$LIB_DIR/vast-llm-ui}"
 BENCH="${VAST_LLM_BENCH:-$LIB_DIR/vast-llm-bench}"
 DOCTOR="${VAST_LLM_DOCTOR:-$LIB_DIR/vast-llm-doctor}"
+AUTO="${VAST_LLM_AUTO:-$LIB_DIR/vast-llm-auto}"
 STATE_DIR="${VAST_LLM_STATE_DIR:-/data/vast-llm}"
 CURRENT_FILE="$STATE_DIR/current_profile"
 SERVER_PATH_FILE="$STATE_DIR/llama_server_path"
 RUNTIME_LD_FILE="$STATE_DIR/llama_runtime_ld_path"
 
-for f in "$CORE" "$UI" "$BENCH" "$DOCTOR"; do
+for f in "$CORE" "$UI" "$BENCH" "$DOCTOR" "$AUTO"; do
   [[ -x "$f" ]] || { printf 'ERROR: missing executable %s. Re-run install.sh.\n' "$f" >&2; exit 1; }
 done
 
@@ -76,9 +82,9 @@ show_splash() {
     printf '%b%b%s%b\n' "$bold" "$color" "${art[$i]}" "$reset"
     sleep_tiny "${VAST_LLM_SPLASH_SPEED:-0.02}"
   done
-  printf '\n%b      Vast.ai GPU inference control plane%b\n' "$dim" "$reset"
-  printf '%b      profiles • tuning • benchmarks • multi-model%b\n\n' "$dim" "$reset"
-  local -a frames=('◐' '◓' '◑' '◒') stages=('CUDA' 'Profiles' 'Benchmark lab' 'Ready')
+  printf '\n%b      Vast.ai native CUDA inference control plane%b\n' "$dim" "$reset"
+  printf '%b      auto-detect • profiles • tuning • benchmarks%b\n\n' "$dim" "$reset"
+  local -a frames=('◐' '◓' '◑' '◒') stages=('NVIDIA CUDA' 'Hardware advisor' 'Profiles' 'Ready')
   for ((i=0;i<4;i++)); do printf '\r%b%s%b  %-18s' "$cyan" "${frames[$i]}" "$reset" "${stages[$i]}"; sleep_tiny "${VAST_LLM_SPLASH_STAGE_SPEED:-0.07}"; done
   printf '\r%b✓%b  %-18s\n\n' "$green" "$reset" 'Control plane online'
   printf '\033[?25h'; trap - EXIT INT TERM
@@ -91,36 +97,40 @@ main_menu() {
     echo
     printf '%bVast.ai LLM Manager%b — current: %s\n' "$c_bold" "$c_reset" "$cur"
     cat <<'EOF'
-  1) Quick settings / performance tuning
-  2) Status
-  3) Start
-  4) Stop
-  5) Restart
-  6) Benchmark Center
-  7) Profiles / switch profile
-  8) Full configuration wizard
-  9) Advanced manager menu
- 10) Show API key
- 11) Doctor / CUDA repair
+  1) Hardware detect + recommended models
+  2) Auto-setup recommended model
+  3) Quick settings / performance tuning
+  4) Status
+  5) Start
+  6) Stop
+  7) Restart
+  8) Benchmark Center
+  9) Profiles / switch profile
+ 10) Full configuration wizard
+ 11) Doctor / native CUDA repair
+ 12) Show API key
+ 13) Advanced manager menu
   0) Exit
 EOF
     read -r -p 'Choose: ' choice || return
     case "$choice" in
-      1) "$UI" settings "$cur" ;;
-      2) "$CORE" status "$cur" ;;
-      3) "$CORE" start "$cur" ;;
-      4) "$CORE" stop "$cur" ;;
-      5) "$CORE" restart "$cur" ;;
-      6) "$BENCH" menu ;;
-      7)
+      1) "$AUTO" recommend ;;
+      2) "$AUTO" setup ;;
+      3) "$UI" settings "$cur" ;;
+      4) "$CORE" status "$cur" ;;
+      5) "$CORE" start "$cur" ;;
+      6) "$CORE" stop "$cur" ;;
+      7) "$CORE" restart "$cur" ;;
+      8) "$BENCH" menu ;;
+      9)
         "$CORE" profiles
         read -r -p 'Profile to use (blank = keep current): ' np || true
         [[ -z "$np" ]] || "$CORE" use "$np"
         ;;
-      8) "$CORE" wizard "$cur" ;;
-      9) "$CORE" menu ;;
-      10) "$CORE" key ;;
+      10) "$CORE" wizard "$cur" ;;
       11) "$DOCTOR" ;;
+      12) "$CORE" key ;;
+      13) "$CORE" menu ;;
       0) return ;;
       *) warn 'Unknown choice.' ;;
     esac
@@ -130,6 +140,12 @@ EOF
 usage() {
   cat <<'EOF'
 Vast LLM Manager additions
+
+Bare-metal / native CUDA:
+  vast-llm hardware                Detect GPU/VRAM/CUDA/RAM/disk
+  vast-llm recommend               Recommend models that fit this server
+  vast-llm auto-setup              Create/download/start a recommended profile
+  vast-llm bootstrap               Build/fix native CUDA llama.cpp + auto-setup
 
 Tuning:
   vast-llm settings [profile]
@@ -152,7 +168,7 @@ Benchmark Center:
   vast-llm bench-custom [profile] [replica]
 
 All ordinary commands (start, stop, restart, status, wizard, profiles, key, etc.)
-are forwarded to the core manager.
+are forwarded to the core manager. Docker is not required.
 EOF
 }
 
@@ -160,6 +176,18 @@ case "${1:-}" in
   ""|menu)
     splash_enabled && show_splash
     main_menu
+    ;;
+  hardware|detect)
+    exec "$AUTO" hardware
+    ;;
+  recommend|models)
+    exec "$AUTO" recommend
+    ;;
+  auto-setup|setup)
+    exec "$AUTO" setup
+    ;;
+  bootstrap|init)
+    exec "$AUTO" bootstrap
     ;;
   settings|tune|quick|set|quick-help)
     exec "$UI" "$@"
