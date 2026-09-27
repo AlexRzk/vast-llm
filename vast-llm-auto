@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE_DIR="${VAST_LLM_STATE_DIR:-/data/vast-llm}"
+PROFILES_DIR="$STATE_DIR/profiles"
+MODEL_DIR="${VAST_LLM_MODEL_DIR:-/data/models}"
+CURRENT_FILE="$STATE_DIR/current_profile"
+LIB_DIR="${VAST_LLM_LIB_DIR:-/usr/local/lib/vast-llm}"
+CORE="${VAST_LLM_CORE:-$LIB_DIR/vast-llm-core}"
+DOCTOR="${VAST_LLM_DOCTOR:-$LIB_DIR/vast-llm-doctor}"
+mkdir -p "$PROFILES_DIR" "$MODEL_DIR"
+
+c_reset='\033[0m'; c_bold='\033[1m'; c_green='\033[32m'; c_yellow='\033[33m'; c_red='\033[31m'; c_cyan='\033[36m'
+[[ -z "${NO_COLOR:-}" ]] || { c_reset=''; c_bold=''; c_green=''; c_yellow=''; c_red=''; c_cyan=''; }
+info(){ printf '%b%s%b\n' "$c_cyan" "$*" "$c_reset"; }
+ok(){ printf '%b%s%b\n' "$c_green" "$*" "$c_reset"; }
+warn(){ printf '%b%s%b\n' "$c_yellow" "$*" "$c_reset" >&2; }
+die(){ printf '%bERROR: %s%b\n' "$c_red" "$*" "$c_reset" >&2; exit 1; }
+
+# id|role|label|repo|patterns|min_vram_gb|weight_gb|native_ctx|mtp|quality|speed|notes
+CATALOG=$(cat <<'CAT'
+qwen38-q5|general|Qwen3.8 27B Q5_K_M|unsloth/Qwen3.8-27B-GGUF|Q5_K_M,UD-Q5_K_XL|28|20.5|262144|1|5|2|Max-quality Qwen3.8 tier; best on 32 GB+ cards.
+qwen38-q4|general|Qwen3.8 27B Q4_K_M|unsloth/Qwen3.8-27B-GGUF|Q4_K_M,UD-Q4_K_XL|22|17.5|262144|1|5|3|Excellent general/reasoning/agent model for a 24 GB GPU.
+qwen3coder-q4|coding|Qwen3-Coder 30B-A3B Q4|unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF|Q4_K_M,UD-Q4_K_XL|22|17.5|262144|0|5|5|Fast MoE coding/implementation model; strong OpenCode choice.
+gemma4-31b-q4|general|Gemma 4 31B Q4_K_M|ggml-org/gemma-4-31B-it-GGUF|Q4_K_M,Q4_0|24|17.5|262144|0|5|2|High-quality dense Gemma; slower decode than MoE alternatives.
+gemma4-26b-q4|general|Gemma 4 26B-A4B Q4_K_M|ggml-org/gemma-4-26B-A4B-it-GGUF|Q4_K_M,Q4_0|20|15.7|262144|0|4|5|Very fast MoE general/agent model (~4B active parameters).
+gemma4-12b-q4|general|Gemma 4 12B Q4|ggml-org/gemma-4-12B-it-GGUF|Q4_K_M,Q4_0|12|7.0|262144|0|3|4|Good fallback for 12-16 GB GPUs.
+qwen35-9b-q4|general|Qwen3.5 9B Q4_K_M|bartowski/Qwen_Qwen3.5-9B-GGUF|Q4_K_M|10|6.0|262144|0|3|4|Compact general model with good quality per GB.
+gemma4-e4b-q8|general|Gemma 4 E4B Q8_0|ggml-org/gemma-4-E4B-it-GGUF|Q8_0,Q6_K,Q5_K_M|8|5.0|131072|0|2|5|Fast lightweight fallback for small GPUs.
+CAT
+)
+
+require_nvidia(){ command -v nvidia-smi >/dev/null 2>&1 || die 'nvidia-smi was not found. This mode requires an NVIDIA driver visible on the host.'; }
+gpu_rows(){ require_nvidia; nvidia-smi --query-gpu=index,name,memory.total,memory.free,compute_cap,driver_version --format=csv,noheader,nounits 2>/dev/null; }
+gpu_count(){ gpu_rows | wc -l | tr -d ' '; }
+all_gpu_ids(){ gpu_rows | awk -F, '{gsub(/ /,"",$1); a=a sep $1; sep=","} END{print a}'; }
+min_total_mb(){ gpu_rows | awk -F, 'BEGIN{m=999999999} {gsub(/ /,"",$3); if($3+0<m)m=$3+0} END{if(m<999999999)print int(m); else print 0}'; }
+min_free_mb(){ gpu_rows | awk -F, 'BEGIN{m=999999999} {gsub(/ /,"",$4); if($4+0<m)m=$4+0} END{if(m<999999999)print int(m); else print 0}'; }
+ram_gb(){ awk '/MemTotal:/ {printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null || printf '?'; }
+disk_gb(){ df -BG "$MODEL_DIR" 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4}' || printf '?'; }
+host_cuda(){ nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -n1; }
+
+hardware_report(){
+  require_nvidia
+  local total free count os='Linux'
+  count="$(gpu_count)"; total="$(min_total_mb)"; free="$(min_free_mb)"
+  [[ -r /etc/os-release ]] && os="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-Linux}")"
+  printf '%bHardware discovery%b\n' "$c_bold" "$c_reset"
+  printf '  Host:          %s\n' "$(hostname 2>/dev/null || printf unknown)"
+  printf '  OS:            %s\n' "$os"
+  printf '  CPU threads:   %s\n' "$(nproc 2>/dev/null || printf '?')"
+  printf '  System RAM:    %s GB\n' "$(ram_gb)"
+  printf '  Model disk:    %s GB free (%s)\n' "$(disk_gb)" "$MODEL_DIR"
+  printf '  CUDA (driver): %s\n' "$(host_cuda)"
+  printf '  GPUs:          %s\n' "$count"
+  echo
+  printf '  %-4s %-31s %10s %10s %8s %12s\n' ID GPU 'VRAM MiB' 'FREE MiB' 'CC' DRIVER
+  gpu_rows | awk -F, '{for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/,"",$i)} printf "  %-4s %-31.31s %10s %10s %8s %12s\n",$1,$2,$3,$4,$5,$6}'
+  echo
+  printf '  Recommendation budget: %.1f GB per replica (smallest GPU total), %.1f GB currently free.\n' "$(awk -v m="$total" 'BEGIN{printf "%.1f",m/1024}')" "$(awk -v m="$free" 'BEGIN{printf "%.1f",m/1024}')"
+  if (( count > 1 )); then printf '  Note: GPU_IDS creates independent replicas; VRAM is not pooled across GPUs.\n'; fi
+}
+
+fit_status(){
+  local min_gb="$1" free_mb="$2" total_mb="$3" need
+  need="$(awk -v g="$min_gb" 'BEGIN{printf "%d",g*1024}')"
+  if (( total_mb < need )); then printf 'NO'; elif (( free_mb >= need )); then printf 'FIT'; else printf 'BUSY'; fi
+}
+
+best_picks(){
+  local gb; gb="$(awk -v m="$1" 'BEGIN{print m/1024}')"
+  printf '%bSuggested defaults%b\n' "$c_bold" "$c_reset"
+  if awk -v g="$gb" 'BEGIN{exit !(g>=28)}'; then printf '  General max quality: Qwen3.8 27B Q5_K_M\n'
+  elif awk -v g="$gb" 'BEGIN{exit !(g>=22)}'; then printf '  General max quality: Qwen3.8 27B Q4_K_M\n'
+  elif awk -v g="$gb" 'BEGIN{exit !(g>=20)}'; then printf '  General / fast:      Gemma 4 26B-A4B Q4\n'
+  elif awk -v g="$gb" 'BEGIN{exit !(g>=12)}'; then printf '  General:             Gemma 4 12B Q4\n'
+  else printf '  General:             Qwen3.5 9B or Gemma 4 E4B\n'; fi
+  if awk -v g="$gb" 'BEGIN{exit !(g>=22)}'; then printf '  Coding / OpenCode:   Qwen3-Coder 30B-A3B Q4\n'
+  else printf '  Coding / OpenCode:   use a compact 9-12B profile or a manual coder GGUF\n'; fi
+}
+
+recommendations(){
+  require_nvidia
+  local total free id role label repo patterns min weight ctx mtp quality speed notes status n=0
+  total="$(min_total_mb)"; free="$(min_free_mb)"
+  printf '%bModel recommendations%b — fit is evaluated per GPU replica\n\n' "$c_bold" "$c_reset"
+  printf '  %-3s %-8s %-34s %-7s %-8s %-7s %-7s\n' '#' ROLE MODEL FIT 'WEIGHTS' QUALITY SPEED
+  while IFS='|' read -r id role label repo patterns min weight ctx mtp quality speed notes; do
+    [[ -n "$id" ]] || continue; status="$(fit_status "$min" "$free" "$total")"; [[ "$status" == NO ]] && continue
+    n=$((n+1)); printf '  %-3s %-8s %-34.34s %-7s %6sGB %7s %7s\n' "$n" "$role" "$label" "$status" "$weight" "$quality/5" "$speed/5"
+  done <<< "$CATALOG"
+  echo
+  (( n > 0 )) || { warn 'No catalog model has enough VRAM on the smallest GPU. Use a smaller GGUF manually.'; return; }
+  printf 'Legend: FIT = can start now; BUSY = total VRAM fits but another process is using too much VRAM.\n'
+  printf 'Quality/speed are coarse selection tiers, not benchmark scores.\n\n'
+  best_picks "$total"
+}
+
+catalog_by_number(){
+  local wanted="$1" total free n=0 id role label repo patterns min weight ctx mtp quality speed notes status
+  total="$(min_total_mb)"; free="$(min_free_mb)"
+  while IFS='|' read -r id role label repo patterns min weight ctx mtp quality speed notes; do
+    [[ -n "$id" ]] || continue; status="$(fit_status "$min" "$free" "$total")"; [[ "$status" == NO ]] && continue; n=$((n+1))
+    if [[ "$n" == "$wanted" ]]; then printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$id" "$role" "$label" "$repo" "$patterns" "$min" "$weight" "$ctx" "$mtp" "$quality" "$speed" "$notes"; return 0; fi
+  done <<< "$CATALOG"
+  return 1
+}
+
+resolve_gguf(){
+  local repo="$1" patterns="$2" tmp
+  command -v curl >/dev/null 2>&1 || return 1
+  tmp="$(mktemp)"; trap 'rm -f "$tmp"' RETURN
+  curl -fsSL "https://huggingface.co/api/models/${repo}" -o "$tmp" 2>/dev/null || return 1
+  python3 - "$patterns" "$tmp" <<'PY'
+import json,sys
+patterns=[p.strip().lower() for p in sys.argv[1].split(',') if p.strip()]
+with open(sys.argv[2],encoding='utf-8') as f: data=json.load(f)
+files=[x.get('rfilename','') for x in data.get('siblings',[]) if x.get('rfilename','').lower().endswith('.gguf')]
+files=[f for f in files if 'mmproj' not in f.lower() and 'draft' not in f.lower() and '/mtp' not in f.lower()]
+for pat in patterns:
+    cand=[f for f in files if pat in f.lower()]
+    if cand:
+        cand.sort(key=lambda f: ('00001-of-' in f.lower(), len(f), f))
+        print(cand[0]); raise SystemExit(0)
+raise SystemExit(2)
+PY
+}
+
+recommended_context(){
+  local native="$1" weight="$2" total_mb="$3" total_gb headroom ctx
+  total_gb="$(awk -v m="$total_mb" 'BEGIN{print m/1024}')"; headroom="$(awk -v t="$total_gb" -v w="$weight" 'BEGIN{print t-w}')"
+  if awk -v h="$headroom" 'BEGIN{exit !(h>=12)}'; then ctx=131072; elif awk -v h="$headroom" 'BEGIN{exit !(h>=6)}'; then ctx=65536; else ctx=32768; fi
+  (( ctx > native )) && ctx="$native"; printf '%s' "$ctx"
+}
+
+safe_name(){ tr '[:upper:]' '[:lower:]' <<< "$1" | sed -E 's/[^a-z0-9._-]+/-/g;s/^-+|-+$//g'; }
+
+write_profile(){
+  local profile="$1" row="$2" gpu_ids="$3" id role label repo patterns min weight native mtp quality speed notes file ctx alias
+  IFS='|' read -r id role label repo patterns min weight native mtp quality speed notes <<< "$row"
+  info "Resolving GGUF filename from Hugging Face: $repo"
+  file="$(resolve_gguf "$repo" "$patterns" || true)"; [[ -n "$file" ]] || die "Could not resolve a GGUF matching [$patterns] in $repo. Use the manual wizard until the catalog is updated."
+  ctx="$(recommended_context "$native" "$weight" "$(min_total_mb)")"; alias="$(safe_name "$id")"
+  cat > "$PROFILES_DIR/$profile.env" <<PROFILEEOF
+MODEL_REPO=$(printf '%q' "$repo")
+MODEL_FILE=$(printf '%q' "$file")
+ALIAS_BASE=$(printf '%q' "$alias")
+GPU_IDS=$(printf '%q' "$gpu_ids")
+PORT_BASE=8000
+CONTEXT=$(printf '%q' "$ctx")
+PARALLEL=1
+GPU_LAYERS=999
+FLASH_ATTN=on
+CACHE_K=q4_0
+CACHE_V=q4_0
+MTP_ENABLED=$(printf '%q' "$mtp")
+MTP_DRAFT_MAX=4
+MTP_P_MIN=0.65
+REASONING_MODE=default
+REASONING_BUDGET=''
+JINJA=1
+NO_MMPROJ=1
+CACHE_REUSE=256
+HOST=127.0.0.1
+EXTRA_ARGS=''
+PROFILEEOF
+  chmod 600 "$PROFILES_DIR/$profile.env"; printf '%s\n' "$profile" > "$CURRENT_FILE"
+  ok "Created profile '$profile'"
+  printf '  Model:    %s\n  Repo:     %s\n  GGUF:     %s\n  GPUs:     %s (independent replicas)\n  Context:  %s\n  MTP:      %s\n' "$label" "$repo" "$file" "$gpu_ids" "$ctx" "$([[ "$mtp" == 1 ]] && printf enabled || printf disabled)"
+}
+
+setup_interactive(){
+  hardware_report; echo; recommendations
+  local choice row id role label repo patterns min weight native mtp quality speed notes profile gpu_ids answer
+  echo; read -r -p 'Recommendation number to configure: ' choice; [[ "$choice" =~ ^[0-9]+$ ]] || die 'Enter a recommendation number.'
+  row="$(catalog_by_number "$choice")" || die 'Unknown recommendation number.'
+  IFS='|' read -r id role label repo patterns min weight native mtp quality speed notes <<< "$row"
+  profile="$(safe_name "$id")"; read -r -p "Profile name [$profile]: " answer || true; profile="${answer:-$profile}"; [[ "$profile" =~ ^[A-Za-z0-9._-]+$ ]] || die 'Invalid profile name.'
+  gpu_ids="$(all_gpu_ids)"; read -r -p "GPU IDs as independent replicas [$gpu_ids]: " answer || true; gpu_ids="${answer:-$gpu_ids}"; [[ "$gpu_ids" =~ ^[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*$ ]] || die 'GPU IDs must look like 0 or 0,1.'
+  write_profile "$profile" "$row" "$gpu_ids"; echo
+  if [[ -x "$CORE" ]]; then
+    read -r -p 'Download the model now? [Y/n]: ' answer || true; [[ "${answer:-y}" =~ ^[Nn]$ ]] || "$CORE" download "$profile"
+    read -r -p 'Start it now? [Y/n]: ' answer || true; [[ "${answer:-y}" =~ ^[Nn]$ ]] || "$CORE" start "$profile"
+  else warn "Core manager not found at $CORE; run install.sh first."; fi
+}
+
+bootstrap(){
+  hardware_report; echo
+  if [[ -x "$DOCTOR" ]]; then info 'Checking/building a native CUDA llama.cpp runtime (no Docker required)...'; "$DOCTOR" --fix || die 'CUDA runtime preparation failed. Review the doctor output above.'
+  else warn "CUDA doctor not installed at $DOCTOR; run bash install.sh first."; fi
+  echo; setup_interactive
+}
+
+usage(){ cat <<'HELP'
+Vast LLM Hardware Advisor (bare-metal CUDA)
+
+Commands:
+  vast-llm hardware       Detect NVIDIA GPUs, VRAM, CUDA, RAM and disk
+  vast-llm recommend      Show models that fit each independent GPU replica
+  vast-llm auto-setup     Pick a recommended model and create/download/start a profile
+  vast-llm bootstrap      Prepare native llama.cpp CUDA, then run auto-setup
+
+No Docker daemon or Docker image is required. The CUDA doctor can build llama.cpp
+natively under the Vast LLM state directory when a working llama-server is absent.
+HELP
+}
+
+case "${1:-recommend}" in
+  hardware|detect) hardware_report ;;
+  recommend|models) hardware_report; echo; recommendations ;;
+  setup|auto-setup) setup_interactive ;;
+  bootstrap|init) bootstrap ;;
+  -h|--help|help) usage ;;
+  *) usage; die "Unknown advisor command '$1'" ;;
+esac
